@@ -26,7 +26,16 @@ def utcnow_iso() -> str:
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
     base_dir = Path(__file__).resolve().parents[1]
-    default_secret = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+    secret_path = base_dir / "instance" / "secret_key"
+    if os.environ.get("SECRET_KEY"):
+        default_secret = os.environ["SECRET_KEY"]
+    elif secret_path.exists():
+        default_secret = secret_path.read_text().strip()
+    else:
+        default_secret = secrets.token_hex(32)
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        secret_path.write_text(default_secret)
+        
     app.config.from_mapping(
         SECRET_KEY=default_secret,
         DATABASE=str(base_dir / "instance" / "minutebooks.sqlite3"),
@@ -42,21 +51,24 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         db_module.init_db()
 
     def log_activity(action: str, details: dict[str, Any] | None = None, user_id: int | None = None) -> None:
-        db = db_module.get_db()
-        db.execute(
-            """
-            INSERT INTO activity_log (user_id, action, timestamp, ip_address, details)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                user_id if user_id is not None else session.get("user_id"),
-                action,
-                utcnow_iso(),
-                request.remote_addr,
-                json.dumps(details or {}),
-            ),
-        )
-        db.commit()
+        try:
+            db = db_module.get_db()
+            db.execute(
+                """
+                INSERT INTO activity_log (user_id, action, timestamp, ip_address, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id if user_id is not None else session.get("user_id"),
+                    action,
+                    utcnow_iso(),
+                    request.remote_addr,
+                    json.dumps(details or {}),
+                ),
+            )
+            db.commit()
+        except Exception:
+            pass
 
     def parse_date(value: str, field_name: str) -> date:
         try:
@@ -87,6 +99,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "work_logs": "SELECT * FROM work_logs WHERE id = ? AND user_id = ?",
             "budgets": "SELECT * FROM budgets WHERE id = ? AND user_id = ?",
             "categories": "SELECT * FROM categories WHERE id = ? AND user_id = ?",
+            "jobs": "SELECT * FROM jobs WHERE id = ? AND user_id = ?",
         }
         query = queries.get(table)
         if query is None:
@@ -99,6 +112,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if row is None:
             return None
         return row
+
+    def validate_fk(table: str, row_id: int | None) -> bool:
+        if row_id is None:
+            return True
+        db = db_module.get_db()
+        row = db.execute(f"SELECT id FROM {table} WHERE id = ? AND user_id = ?", (row_id, session["user_id"])).fetchone()
+        return row is not None
 
     @app.get("/health")
     def health():
@@ -215,6 +235,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if amount < 0:
                 raise ClientInputError("amount cannot be negative")
 
+            category_id = payload.get("category_id")
+            if not validate_fk("categories", category_id):
+                return jsonify({"error": "Invalid category_id"}), 400
+
             occurred_str = payload.get("date_occurred", date.today().isoformat())
             occurred = parse_date(occurred_str, "date_occurred")
             pending = int(occurred > date.today())
@@ -254,6 +278,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if amount < 0:
             return jsonify({"error": "amount cannot be negative"}), 400
 
+        category_id = payload.get("category_id", row["category_id"])
+        if not validate_fk("categories", category_id):
+            return jsonify({"error": "Invalid category_id"}), 400
+
         occurred = parse_date(payload.get("date_occurred", row["date_occurred"]), "date_occurred")
         pending = int(occurred > date.today())
 
@@ -266,7 +294,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             """,
             (
                 amount,
-                payload.get("category_id", row["category_id"]),
+                category_id,
                 occurred.isoformat(),
                 pending,
                 payload.get("notes", row["notes"]),
@@ -300,6 +328,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "work-logs": "Work log",
             "budgets": "Budget",
             "categories": "Category",
+            "jobs": "Job",
         }.get(resource_name, "Item")
 
         @app.get(list_route, endpoint=f"list_{resource_name}")
@@ -311,6 +340,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "work_logs": "SELECT * FROM work_logs WHERE user_id = ? ORDER BY id DESC",
                 "budgets": "SELECT * FROM budgets WHERE user_id = ? ORDER BY id DESC",
                 "categories": "SELECT * FROM categories WHERE user_id = ? ORDER BY id DESC",
+                "jobs": "SELECT * FROM jobs WHERE user_id = ? ORDER BY id DESC",
             }
             query = list_queries.get(table)
             if query is None:
@@ -332,28 +362,37 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 amount = float(payload.get("amount", 0))
                 if amount < 0:
                     return jsonify({"error": "amount cannot be negative"}), 400
+                job_id = payload.get("job_id")
+                if not validate_fk("jobs", job_id):
+                    return jsonify({"error": "Invalid job_id"}), 400
                 entry_date = parse_date(payload.get("date", date.today().isoformat()), "date")
                 cursor = db.execute(
                     "INSERT INTO income (user_id, amount, job_id, date, logged_at) VALUES (?, ?, ?, ?, ?)",
-                    (session["user_id"], amount, payload.get("job_id"), entry_date.isoformat(), now),
+                    (session["user_id"], amount, job_id, entry_date.isoformat(), now),
                 )
             elif table == "work_logs":
                 hours = float(payload.get("hours", 0))
                 if hours < 0:
                     return jsonify({"error": "hours cannot be negative"}), 400
+                job_id = payload.get("job_id")
+                if not validate_fk("jobs", job_id):
+                    return jsonify({"error": "Invalid job_id"}), 400
                 entry_date = parse_date(payload.get("date", date.today().isoformat()), "date")
                 cursor = db.execute(
                     "INSERT INTO work_logs (user_id, job_id, hours, date, logged_at) VALUES (?, ?, ?, ?, ?)",
-                    (session["user_id"], payload.get("job_id"), hours, entry_date.isoformat(), now),
+                    (session["user_id"], job_id, hours, entry_date.isoformat(), now),
                 )
             elif table == "budgets":
                 amount = float(payload.get("amount", 0))
                 if amount < 0:
                     return jsonify({"error": "amount cannot be negative"}), 400
+                category_id = payload.get("category_id")
+                if not validate_fk("categories", category_id):
+                    return jsonify({"error": "Invalid category_id"}), 400
                 period = payload.get("period", "month")
                 cursor = db.execute(
                     "INSERT INTO budgets (user_id, category_id, amount, period) VALUES (?, ?, ?, ?)",
-                    (session["user_id"], payload.get("category_id"), amount, period),
+                    (session["user_id"], category_id, amount, period),
                 )
             elif table == "categories":
                 name = str(payload.get("name", "")).strip()
@@ -362,6 +401,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 cursor = db.execute(
                     "INSERT INTO categories (user_id, name, is_custom, created_at) VALUES (?, ?, 1, ?)",
                     (session["user_id"], name, now),
+                )
+            elif table == "jobs":
+                title = str(payload.get("title", "")).strip()
+                if not title:
+                    return jsonify({"error": "title cannot be empty"}), 400
+                hourly_rate = float(payload.get("hourly_rate", 0))
+                if hourly_rate < 0:
+                    return jsonify({"error": "hourly_rate cannot be negative"}), 400
+                cursor = db.execute(
+                    "INSERT INTO jobs (user_id, title, hourly_rate) VALUES (?, ?, ?)",
+                    (session["user_id"], title, hourly_rate),
                 )
             else:
                 return jsonify({"error": "Unsupported table"}), 500

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS budgets (
     category_id INTEGER,
     amount REAL NOT NULL CHECK(amount >= 0),
     period TEXT NOT NULL,
+    UNIQUE(user_id, category_id, period),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE SET NULL
 );
