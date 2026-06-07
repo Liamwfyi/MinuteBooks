@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
+import sqlite3
 from datetime import date, datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -19,8 +22,9 @@ def utcnow_iso() -> str:
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
     base_dir = Path(__file__).resolve().parents[1]
+    default_secret = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
     app.config.from_mapping(
-        SECRET_KEY="dev-secret",
+        SECRET_KEY=default_secret,
         DATABASE=str(base_dir / "instance" / "minutebooks.sqlite3"),
     )
 
@@ -73,9 +77,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         return wrapper
 
     def fetch_row_or_404(table: str, row_id: int):
+        queries = {
+            "expenses": "SELECT * FROM expenses WHERE id = ? AND user_id = ?",
+            "income": "SELECT * FROM income WHERE id = ? AND user_id = ?",
+            "work_logs": "SELECT * FROM work_logs WHERE id = ? AND user_id = ?",
+            "budgets": "SELECT * FROM budgets WHERE id = ? AND user_id = ?",
+            "categories": "SELECT * FROM categories WHERE id = ? AND user_id = ?",
+        }
+        query = queries.get(table)
+        if query is None:
+            raise ValueError("Unsupported table")
         db = db_module.get_db()
         row = db.execute(
-            f"SELECT * FROM {table} WHERE id = ? AND user_id = ?",
+            query,
             (row_id, session["user_id"]),
         ).fetchone()
         if row is None:
@@ -131,9 +145,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             session["user_id"] = user_id
             log_activity("register", {"username": username}, user_id=user_id)
             return jsonify({"id": user_id, "username": username}), 201
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
-        except Exception:
+        except ValueError:
+            return jsonify({"error": "Invalid registration payload"}), 400
+        except sqlite3.IntegrityError:
             return jsonify({"error": "username already exists"}), 409
 
     @app.post("/login")
@@ -158,8 +172,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             session["user_id"] = user["id"]
             log_activity("login", {"username": user["username"]}, user_id=user["id"])
             return jsonify({"id": user["id"], "username": user["username"]})
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        except ValueError:
+            return jsonify({"error": "Invalid login payload"}), 400
 
     @app.post("/logout")
     @login_required
@@ -218,8 +232,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             db.commit()
             log_activity("expense.create", {"expense_id": cursor.lastrowid})
             return jsonify({"id": cursor.lastrowid, "is_pending": bool(pending)}), 201
-        except (TypeError, ValueError) as exc:
-            return jsonify({"error": str(exc)}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid expense payload"}), 400
 
     @app.put("/expenses/<int:expense_id>")
     @login_required
@@ -279,8 +293,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         @login_required
         def list_items():
             db = db_module.get_db()
+            list_queries = {
+                "income": "SELECT * FROM income WHERE user_id = ? ORDER BY id DESC",
+                "work_logs": "SELECT * FROM work_logs WHERE user_id = ? ORDER BY id DESC",
+                "budgets": "SELECT * FROM budgets WHERE user_id = ? ORDER BY id DESC",
+                "categories": "SELECT * FROM categories WHERE user_id = ? ORDER BY id DESC",
+            }
+            query = list_queries.get(table)
+            if query is None:
+                return jsonify({"error": "Unsupported table"}), 500
             rows = db.execute(
-                f"SELECT * FROM {table} WHERE user_id = ? ORDER BY id DESC",
+                query,
                 (session["user_id"],),
             ).fetchall()
             return jsonify([dict(row) for row in rows])
@@ -392,8 +415,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         @login_required
         def delete_item(item_id: int):
             db = db_module.get_db()
+            delete_queries = {
+                "income": "DELETE FROM income WHERE id = ? AND user_id = ?",
+                "work_logs": "DELETE FROM work_logs WHERE id = ? AND user_id = ?",
+                "budgets": "DELETE FROM budgets WHERE id = ? AND user_id = ?",
+                "categories": "DELETE FROM categories WHERE id = ? AND user_id = ?",
+            }
+            query = delete_queries.get(table)
+            if query is None:
+                return jsonify({"error": "Unsupported table"}), 500
             deleted = db.execute(
-                f"DELETE FROM {table} WHERE id = ? AND user_id = ?",
+                query,
                 (item_id, session["user_id"]),
             ).rowcount
             db.commit()
@@ -423,7 +455,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     def update_settings():
         payload = request.get_json(silent=True) or {}
-        allowed = {
+        allowed_fields = {
             "dark_mode",
             "color_primary",
             "color_background",
@@ -431,16 +463,35 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             "color_text",
             "currency",
         }
-        updates = {key: payload[key] for key in payload if key in allowed}
-        if not updates:
+        if not any(key in payload for key in allowed_fields):
             return jsonify({"error": "No valid settings provided"}), 400
 
-        fields = ", ".join(f"{key} = ?" for key in updates)
-        params = list(updates.values()) + [session["user_id"]]
         db = db_module.get_db()
-        db.execute(f"UPDATE user_settings SET {fields} WHERE user_id = ?", params)
+        existing = db.execute(
+            "SELECT * FROM user_settings WHERE user_id = ?",
+            (session["user_id"],),
+        ).fetchone()
+        if existing is None:
+            return jsonify({"error": "Settings not found"}), 404
+
+        db.execute(
+            """
+            UPDATE user_settings
+            SET dark_mode = ?, color_primary = ?, color_background = ?, color_accent = ?, color_text = ?, currency = ?
+            WHERE user_id = ?
+            """,
+            (
+                int(payload.get("dark_mode", existing["dark_mode"])),
+                payload.get("color_primary", existing["color_primary"]),
+                payload.get("color_background", existing["color_background"]),
+                payload.get("color_accent", existing["color_accent"]),
+                payload.get("color_text", existing["color_text"]),
+                payload.get("currency", existing["currency"]),
+                session["user_id"],
+            ),
+        )
         db.commit()
-        log_activity("settings.update", {"updated_fields": list(updates.keys())})
+        log_activity("settings.update", {"updated_fields": [key for key in payload if key in allowed_fields]})
         return jsonify({"message": "Settings updated"})
 
     @app.get("/analytics")
