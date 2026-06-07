@@ -15,6 +15,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from . import db as db_module
 
 
+class ClientInputError(ValueError):
+    pass
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -57,14 +61,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def parse_date(value: str, field_name: str) -> date:
         try:
             return date.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError(f"{field_name} must be in YYYY-MM-DD format") from exc
+        except ValueError:
+            raise ClientInputError(f"{field_name} must be in YYYY-MM-DD format")
 
     def require_json(required_fields: list[str]) -> dict[str, Any]:
         payload = request.get_json(silent=True) or {}
         missing = [field for field in required_fields if field not in payload]
         if missing:
-            raise ValueError(f"Missing required fields: {', '.join(missing)}")
+            raise ClientInputError(f"Missing required fields: {', '.join(missing)}")
         return payload
 
     def login_required(func):
@@ -107,9 +111,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             username = payload["username"].strip()
             password = payload["password"]
             if not username:
-                raise ValueError("username cannot be empty")
+                raise ClientInputError("username cannot be empty")
             if len(password) < 6:
-                raise ValueError("password must be at least 6 characters")
+                raise ClientInputError("password must be at least 6 characters")
 
             db = db_module.get_db()
             now = utcnow_iso()
@@ -145,7 +149,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             session["user_id"] = user_id
             log_activity("register", {"username": username}, user_id=user_id)
             return jsonify({"id": user_id, "username": username}), 201
-        except ValueError:
+        except ClientInputError:
             return jsonify({"error": "Invalid registration payload"}), 400
         except sqlite3.IntegrityError:
             return jsonify({"error": "username already exists"}), 409
@@ -172,7 +176,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             session["user_id"] = user["id"]
             log_activity("login", {"username": user["username"]}, user_id=user["id"])
             return jsonify({"id": user["id"], "username": user["username"]})
-        except ValueError:
+        except ClientInputError:
             return jsonify({"error": "Invalid login payload"}), 400
 
     @app.post("/logout")
@@ -204,9 +208,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def create_expense():
         try:
             payload = require_json(["amount", "category_id"])
-            amount = float(payload["amount"])
+            try:
+                amount = float(payload["amount"])
+            except (TypeError, ValueError):
+                raise ClientInputError("amount must be a number")
             if amount < 0:
-                raise ValueError("amount cannot be negative")
+                raise ClientInputError("amount cannot be negative")
 
             occurred_str = payload.get("date_occurred", date.today().isoformat())
             occurred = parse_date(occurred_str, "date_occurred")
@@ -232,7 +239,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             db.commit()
             log_activity("expense.create", {"expense_id": cursor.lastrowid})
             return jsonify({"id": cursor.lastrowid, "is_pending": bool(pending)}), 201
-        except (TypeError, ValueError):
+        except (ClientInputError, TypeError, ValueError):
             return jsonify({"error": "Invalid expense payload"}), 400
 
     @app.put("/expenses/<int:expense_id>")
@@ -288,6 +295,12 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def register_simple_crud(resource_name: str, table: str, amount_field: str = "amount"):
         list_route = f"/{resource_name}"
         item_route = f"/{resource_name}/<int:item_id>"
+        singular_label = {
+            "income": "Income",
+            "work-logs": "Work log",
+            "budgets": "Budget",
+            "categories": "Category",
+        }.get(resource_name, "Item")
 
         @app.get(list_route, endpoint=f"list_{resource_name}")
         @login_required
@@ -363,7 +376,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             payload = request.get_json(silent=True) or {}
             row = fetch_row_or_404(table, item_id)
             if row is None:
-                return jsonify({"error": f"{resource_name[:-1].capitalize()} not found"}), 404
+                return jsonify({"error": f"{singular_label} not found"}), 404
             db = db_module.get_db()
 
             if table == "income":
@@ -430,7 +443,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             ).rowcount
             db.commit()
             if not deleted:
-                return jsonify({"error": f"{resource_name[:-1].capitalize()} not found"}), 404
+                return jsonify({"error": f"{singular_label} not found"}), 404
             log_activity(f"{table}.delete", {"id": item_id})
             return jsonify({"message": "Deleted"})
 
