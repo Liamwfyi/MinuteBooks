@@ -1,0 +1,481 @@
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, jsonify, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from . import db as db_module
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def create_app(test_config: dict[str, Any] | None = None) -> Flask:
+    app = Flask(__name__)
+    base_dir = Path(__file__).resolve().parents[1]
+    app.config.from_mapping(
+        SECRET_KEY="dev-secret",
+        DATABASE=str(base_dir / "instance" / "minutebooks.sqlite3"),
+    )
+
+    if test_config:
+        app.config.update(test_config)
+
+    Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
+    db_module.init_app(app)
+
+    with app.app_context():
+        db_module.init_db()
+
+    def log_activity(action: str, details: dict[str, Any] | None = None, user_id: int | None = None) -> None:
+        db = db_module.get_db()
+        db.execute(
+            """
+            INSERT INTO activity_log (user_id, action, timestamp, ip_address, details)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                user_id if user_id is not None else session.get("user_id"),
+                action,
+                utcnow_iso(),
+                request.remote_addr,
+                json.dumps(details or {}),
+            ),
+        )
+        db.commit()
+
+    def parse_date(value: str, field_name: str) -> date:
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be in YYYY-MM-DD format") from exc
+
+    def require_json(required_fields: list[str]) -> dict[str, Any]:
+        payload = request.get_json(silent=True) or {}
+        missing = [field for field in required_fields if field not in payload]
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(missing)}")
+        return payload
+
+    def login_required(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                return jsonify({"error": "Authentication required"}), 401
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    def fetch_row_or_404(table: str, row_id: int):
+        db = db_module.get_db()
+        row = db.execute(
+            f"SELECT * FROM {table} WHERE id = ? AND user_id = ?",
+            (row_id, session["user_id"]),
+        ).fetchone()
+        if row is None:
+            return None
+        return row
+
+    @app.get("/health")
+    def health():
+        return jsonify({"status": "ok"})
+
+    @app.post("/register")
+    def register():
+        try:
+            payload = require_json(["username", "password"])
+            username = payload["username"].strip()
+            password = payload["password"]
+            if not username:
+                raise ValueError("username cannot be empty")
+            if len(password) < 6:
+                raise ValueError("password must be at least 6 characters")
+
+            db = db_module.get_db()
+            now = utcnow_iso()
+            cursor = db.execute(
+                """
+                INSERT INTO users (username, password_hash, preferred_currency, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, generate_password_hash(password), payload.get("currency", "USD"), now),
+            )
+            user_id = cursor.lastrowid
+            db.execute(
+                """
+                INSERT INTO user_settings (user_id, currency)
+                VALUES (?, ?)
+                """,
+                (user_id, payload.get("currency", "USD")),
+            )
+            default_categories = [
+                "groceries",
+                "entertainment",
+                "transport",
+                "dining",
+                "utilities",
+            ]
+            for name in default_categories:
+                db.execute(
+                    "INSERT INTO categories (user_id, name, is_custom, created_at) VALUES (?, ?, 0, ?)",
+                    (user_id, name, now),
+                )
+            db.commit()
+            session.clear()
+            session["user_id"] = user_id
+            log_activity("register", {"username": username}, user_id=user_id)
+            return jsonify({"id": user_id, "username": username}), 201
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception:
+            return jsonify({"error": "username already exists"}), 409
+
+    @app.post("/login")
+    def login():
+        try:
+            payload = require_json(["username", "password"])
+            db = db_module.get_db()
+            user = db.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (payload["username"].strip(),),
+            ).fetchone()
+            if user is None or not check_password_hash(user["password_hash"], payload["password"]):
+                return jsonify({"error": "Invalid username or password"}), 401
+
+            now = utcnow_iso()
+            db.execute(
+                "UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?",
+                (now, request.remote_addr, user["id"]),
+            )
+            db.commit()
+            session.clear()
+            session["user_id"] = user["id"]
+            log_activity("login", {"username": user["username"]}, user_id=user["id"])
+            return jsonify({"id": user["id"], "username": user["username"]})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/logout")
+    @login_required
+    def logout():
+        user_id = session["user_id"]
+        session.clear()
+        log_activity("logout", user_id=user_id)
+        return jsonify({"message": "Logged out"})
+
+    @app.get("/expenses")
+    @login_required
+    def list_expenses():
+        db = db_module.get_db()
+        rows = db.execute(
+            """
+            SELECT e.*, c.name AS category_name
+            FROM expenses e
+            LEFT JOIN categories c ON c.id = e.category_id
+            WHERE e.user_id = ?
+            ORDER BY e.date_occurred DESC, e.id DESC
+            """,
+            (session["user_id"],),
+        ).fetchall()
+        return jsonify([dict(row) for row in rows])
+
+    @app.post("/expenses")
+    @login_required
+    def create_expense():
+        try:
+            payload = require_json(["amount", "category_id"])
+            amount = float(payload["amount"])
+            if amount < 0:
+                raise ValueError("amount cannot be negative")
+
+            occurred_str = payload.get("date_occurred", date.today().isoformat())
+            occurred = parse_date(occurred_str, "date_occurred")
+            pending = int(occurred > date.today())
+            now = utcnow_iso()
+            db = db_module.get_db()
+            cursor = db.execute(
+                """
+                INSERT INTO expenses (user_id, amount, category_id, date_occurred, date_logged, is_pending, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session["user_id"],
+                    amount,
+                    payload["category_id"],
+                    occurred.isoformat(),
+                    now,
+                    pending,
+                    payload.get("notes"),
+                    now,
+                ),
+            )
+            db.commit()
+            log_activity("expense.create", {"expense_id": cursor.lastrowid})
+            return jsonify({"id": cursor.lastrowid, "is_pending": bool(pending)}), 201
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.put("/expenses/<int:expense_id>")
+    @login_required
+    def update_expense(expense_id: int):
+        row = fetch_row_or_404("expenses", expense_id)
+        if row is None:
+            return jsonify({"error": "Expense not found"}), 404
+        payload = request.get_json(silent=True) or {}
+
+        amount = float(payload.get("amount", row["amount"]))
+        if amount < 0:
+            return jsonify({"error": "amount cannot be negative"}), 400
+
+        occurred = parse_date(payload.get("date_occurred", row["date_occurred"]), "date_occurred")
+        pending = int(occurred > date.today())
+
+        db = db_module.get_db()
+        db.execute(
+            """
+            UPDATE expenses
+            SET amount = ?, category_id = ?, date_occurred = ?, is_pending = ?, notes = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                amount,
+                payload.get("category_id", row["category_id"]),
+                occurred.isoformat(),
+                pending,
+                payload.get("notes", row["notes"]),
+                expense_id,
+                session["user_id"],
+            ),
+        )
+        db.commit()
+        log_activity("expense.update", {"expense_id": expense_id})
+        return jsonify({"id": expense_id, "is_pending": bool(pending)})
+
+    @app.delete("/expenses/<int:expense_id>")
+    @login_required
+    def delete_expense(expense_id: int):
+        db = db_module.get_db()
+        deleted = db.execute(
+            "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+            (expense_id, session["user_id"]),
+        ).rowcount
+        db.commit()
+        if not deleted:
+            return jsonify({"error": "Expense not found"}), 404
+        log_activity("expense.delete", {"expense_id": expense_id})
+        return jsonify({"message": "Deleted"})
+
+    def register_simple_crud(resource_name: str, table: str, amount_field: str = "amount"):
+        list_route = f"/{resource_name}"
+        item_route = f"/{resource_name}/<int:item_id>"
+
+        @app.get(list_route, endpoint=f"list_{resource_name}")
+        @login_required
+        def list_items():
+            db = db_module.get_db()
+            rows = db.execute(
+                f"SELECT * FROM {table} WHERE user_id = ? ORDER BY id DESC",
+                (session["user_id"],),
+            ).fetchall()
+            return jsonify([dict(row) for row in rows])
+
+        @app.post(list_route, endpoint=f"create_{resource_name}")
+        @login_required
+        def create_item():
+            payload = request.get_json(silent=True) or {}
+            db = db_module.get_db()
+            now = utcnow_iso()
+
+            if table == "income":
+                amount = float(payload.get("amount", 0))
+                if amount < 0:
+                    return jsonify({"error": "amount cannot be negative"}), 400
+                entry_date = parse_date(payload.get("date", date.today().isoformat()), "date")
+                cursor = db.execute(
+                    "INSERT INTO income (user_id, amount, job_id, date, logged_at) VALUES (?, ?, ?, ?, ?)",
+                    (session["user_id"], amount, payload.get("job_id"), entry_date.isoformat(), now),
+                )
+            elif table == "work_logs":
+                hours = float(payload.get("hours", 0))
+                if hours < 0:
+                    return jsonify({"error": "hours cannot be negative"}), 400
+                entry_date = parse_date(payload.get("date", date.today().isoformat()), "date")
+                cursor = db.execute(
+                    "INSERT INTO work_logs (user_id, job_id, hours, date, logged_at) VALUES (?, ?, ?, ?, ?)",
+                    (session["user_id"], payload.get("job_id"), hours, entry_date.isoformat(), now),
+                )
+            elif table == "budgets":
+                amount = float(payload.get("amount", 0))
+                if amount < 0:
+                    return jsonify({"error": "amount cannot be negative"}), 400
+                period = payload.get("period", "month")
+                cursor = db.execute(
+                    "INSERT INTO budgets (user_id, category_id, amount, period) VALUES (?, ?, ?, ?)",
+                    (session["user_id"], payload.get("category_id"), amount, period),
+                )
+            elif table == "categories":
+                name = str(payload.get("name", "")).strip()
+                if not name:
+                    return jsonify({"error": "name cannot be empty"}), 400
+                cursor = db.execute(
+                    "INSERT INTO categories (user_id, name, is_custom, created_at) VALUES (?, ?, 1, ?)",
+                    (session["user_id"], name, now),
+                )
+            else:
+                return jsonify({"error": "Unsupported table"}), 500
+
+            db.commit()
+            log_activity(f"{table}.create", {"id": cursor.lastrowid})
+            return jsonify({"id": cursor.lastrowid}), 201
+
+        @app.put(item_route, endpoint=f"update_{resource_name}")
+        @login_required
+        def update_item(item_id: int):
+            payload = request.get_json(silent=True) or {}
+            row = fetch_row_or_404(table, item_id)
+            if row is None:
+                return jsonify({"error": f"{resource_name[:-1].capitalize()} not found"}), 404
+            db = db_module.get_db()
+
+            if table == "income":
+                amount = float(payload.get("amount", row[amount_field]))
+                if amount < 0:
+                    return jsonify({"error": "amount cannot be negative"}), 400
+                entry_date = parse_date(payload.get("date", row["date"]), "date")
+                db.execute(
+                    "UPDATE income SET amount = ?, job_id = ?, date = ? WHERE id = ? AND user_id = ?",
+                    (amount, payload.get("job_id", row["job_id"]), entry_date.isoformat(), item_id, session["user_id"]),
+                )
+            elif table == "work_logs":
+                hours = float(payload.get("hours", row["hours"]))
+                if hours < 0:
+                    return jsonify({"error": "hours cannot be negative"}), 400
+                entry_date = parse_date(payload.get("date", row["date"]), "date")
+                db.execute(
+                    "UPDATE work_logs SET hours = ?, job_id = ?, date = ? WHERE id = ? AND user_id = ?",
+                    (hours, payload.get("job_id", row["job_id"]), entry_date.isoformat(), item_id, session["user_id"]),
+                )
+            elif table == "budgets":
+                amount = float(payload.get("amount", row[amount_field]))
+                if amount < 0:
+                    return jsonify({"error": "amount cannot be negative"}), 400
+                db.execute(
+                    "UPDATE budgets SET category_id = ?, amount = ?, period = ? WHERE id = ? AND user_id = ?",
+                    (
+                        payload.get("category_id", row["category_id"]),
+                        amount,
+                        payload.get("period", row["period"]),
+                        item_id,
+                        session["user_id"],
+                    ),
+                )
+            elif table == "categories":
+                name = str(payload.get("name", row["name"])).strip()
+                if not name:
+                    return jsonify({"error": "name cannot be empty"}), 400
+                db.execute(
+                    "UPDATE categories SET name = ? WHERE id = ? AND user_id = ?",
+                    (name, item_id, session["user_id"]),
+                )
+
+            db.commit()
+            log_activity(f"{table}.update", {"id": item_id})
+            return jsonify({"id": item_id})
+
+        @app.delete(item_route, endpoint=f"delete_{resource_name}")
+        @login_required
+        def delete_item(item_id: int):
+            db = db_module.get_db()
+            deleted = db.execute(
+                f"DELETE FROM {table} WHERE id = ? AND user_id = ?",
+                (item_id, session["user_id"]),
+            ).rowcount
+            db.commit()
+            if not deleted:
+                return jsonify({"error": f"{resource_name[:-1].capitalize()} not found"}), 404
+            log_activity(f"{table}.delete", {"id": item_id})
+            return jsonify({"message": "Deleted"})
+
+    register_simple_crud("income", "income")
+    register_simple_crud("work-logs", "work_logs", amount_field="hours")
+    register_simple_crud("budgets", "budgets")
+    register_simple_crud("categories", "categories")
+
+    @app.get("/settings")
+    @login_required
+    def get_settings():
+        db = db_module.get_db()
+        row = db.execute(
+            "SELECT * FROM user_settings WHERE user_id = ?",
+            (session["user_id"],),
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Settings not found"}), 404
+        return jsonify(dict(row))
+
+    @app.put("/settings")
+    @login_required
+    def update_settings():
+        payload = request.get_json(silent=True) or {}
+        allowed = {
+            "dark_mode",
+            "color_primary",
+            "color_background",
+            "color_accent",
+            "color_text",
+            "currency",
+        }
+        updates = {key: payload[key] for key in payload if key in allowed}
+        if not updates:
+            return jsonify({"error": "No valid settings provided"}), 400
+
+        fields = ", ".join(f"{key} = ?" for key in updates)
+        params = list(updates.values()) + [session["user_id"]]
+        db = db_module.get_db()
+        db.execute(f"UPDATE user_settings SET {fields} WHERE user_id = ?", params)
+        db.commit()
+        log_activity("settings.update", {"updated_fields": list(updates.keys())})
+        return jsonify({"message": "Settings updated"})
+
+    @app.get("/analytics")
+    @login_required
+    def analytics():
+        db = db_module.get_db()
+        user_id = session["user_id"]
+        totals = db.execute(
+            """
+            SELECT
+                COALESCE((SELECT SUM(amount) FROM income WHERE user_id = ?), 0) AS total_income,
+                COALESCE((SELECT SUM(amount) FROM expenses WHERE user_id = ?), 0) AS total_expenses,
+                COALESCE((SELECT SUM(hours) FROM work_logs WHERE user_id = ?), 0) AS total_hours
+            """,
+            (user_id, user_id, user_id),
+        ).fetchone()
+
+        by_category = db.execute(
+            """
+            SELECT c.name AS category, COALESCE(SUM(e.amount), 0) AS total
+            FROM categories c
+            LEFT JOIN expenses e ON e.category_id = c.id AND e.user_id = c.user_id
+            WHERE c.user_id = ?
+            GROUP BY c.id, c.name
+            ORDER BY total DESC, c.name ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        return jsonify(
+            {
+                "totals": dict(totals),
+                "balance": totals["total_income"] - totals["total_expenses"],
+                "spending_by_category": [dict(row) for row in by_category],
+            }
+        )
+
+    return app
